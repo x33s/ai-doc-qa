@@ -17,7 +17,8 @@ from rag_core import (
     load_documents_from_folder,
     split_documents,
     TFIDFRetriever,
-    create_rag_chain
+    create_rag_chain,
+    extract_sources_from_answer
 )
 
 # ============================================
@@ -29,14 +30,13 @@ docs_folder = os.path.join(os.path.dirname(__file__), "docs")
 
 
 # ============================================
-# Lifespan 事件处理（替代旧的 on_event）
+# Lifespan 事件处理
 # ============================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """处理应用启动和关闭时的逻辑"""
     global rag_chain, retriever, docs_folder
     
-    # --- 启动逻辑 (原 startup 事件) ---
     print("🚀 启动智能文档问答 API 服务...")
     print(f"📁 文档目录: {docs_folder}")
     
@@ -51,10 +51,8 @@ async def lifespan(app: FastAPI):
     else:
         print("⚠️ 没有找到文档，请通过 /upload 接口上传文件")
     
-    # yield 将应用逻辑分隔为启动和关闭两部分
     yield
     
-    # --- 关闭逻辑 (原 shutdown 事件) ---
     print("🛑 应用正在关闭，清理资源...")
 
 
@@ -64,7 +62,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="智能文档问答 API",
     version="1.0",
-    lifespan=lifespan  # 使用 lifespan 替代 on_event
+    lifespan=lifespan
 )
 
 
@@ -106,7 +104,6 @@ async def upload_file(file: UploadFile = File(...)):
     """上传文档"""
     global rag_chain, retriever
     
-    # 确保 docs 目录存在
     os.makedirs(docs_folder, exist_ok=True)
     
     file_path = os.path.join(docs_folder, file.filename)
@@ -144,19 +141,34 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=503, detail="RAG 系统未初始化，请先上传文档")
     
     try:
-        answer = rag_chain(request.question)
+        # 检索相关文档
+        relevant_docs = retriever.retrieve(request.question)
         
-        # 获取检索来源
+        # 调用 RAG
+        raw_answer = rag_chain(request.question)
+        
+        # 解析来源标注
+        import re
+        pattern = r'【来源：文档(\d+)】'
+        match = re.search(pattern, raw_answer)
+        
         sources = []
-        if retriever:
-            docs = retriever.retrieve(request.question)
-            sources = [doc.page_content[:150] + "..." for doc in docs[:2]]
+        clean_answer = raw_answer
         
-        return ChatResponse(answer=answer, sources=sources)
+        if match and relevant_docs:
+            idx = int(match.group(1)) - 1
+            if 0 <= idx < len(relevant_docs):
+                content = relevant_docs[idx].page_content
+                preview = content[:200] + "..." if len(content) > 200 else content
+                sources.append(preview)
+            # 移除标注
+            clean_answer = re.sub(r'\s*【来源：文档\d+】\s*', '', raw_answer)
+        
+        return ChatResponse(answer=clean_answer, sources=sources)
+        
     except Exception as e:
         print(f"错误: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.delete("/documents/{filename}")
 async def delete_document(filename: str):
@@ -189,5 +201,4 @@ async def delete_document(filename: str):
 # ============================================
 if __name__ == "__main__":
     import uvicorn
-    # 注意：这里去掉了 reload=True，避免警告
     uvicorn.run(app, host="0.0.0.0", port=8000)

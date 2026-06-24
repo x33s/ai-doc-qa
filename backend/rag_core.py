@@ -1,15 +1,14 @@
 """backend/rag_core.py - RAG 核心模块"""
 import os
+import re
 import numpy as np
 from dotenv import load_dotenv
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, UnstructuredWordDocumentLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
 
-# 加载环境变量（从 backend 目录向上找父目录的 .env）
+# 加载环境变量
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 # ============================================
@@ -29,7 +28,6 @@ RETRIEVAL_TOP_K = 4
 def load_documents_from_folder(folder_path=None):
     """加载文件夹内的所有 PDF、TXT 和 Word 文件"""
     if folder_path is None:
-        # 默认使用 backend/docs 目录
         folder_path = os.path.join(os.path.dirname(__file__), "docs")
     
     all_documents = []
@@ -127,47 +125,90 @@ class TFIDFRetriever:
 
 
 # ============================================
-# RAG 问答
+# RAG 问答（带来源标注）
+# ============================================
+# ============================================
+# RAG 问答（终极修复版：严禁编造来源）
+# ============================================
+ # ============================================
+# RAG 问答（修复版：基于文档回答，不拒绝）
 # ============================================
 def create_rag_chain(retriever):
     """创建 RAG 问答函数"""
-    llm = ChatOpenAI(
-        model="qwen-plus",
-        temperature=0.1,
-        openai_api_key=DASHSCOPE_API_KEY,
-        openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    from openai import OpenAI
+    
+    client = OpenAI(
+        api_key=DASHSCOPE_API_KEY,
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
     )
     
     def ask(question):
         # 1. 检索相关文档
         docs = retriever.retrieve(question)
         
-        # 2. 构建上下文
+        # 2. 构建带编号的上下文
         if docs:
-            context = "\n\n---\n\n".join([doc.page_content for doc in docs])
+            context_parts = []
+            for i, doc in enumerate(docs):
+                source_file = os.path.basename(doc.metadata.get('source', 'unknown'))
+                content = doc.page_content
+                context_parts.append(f"【文档{i+1}】（来自 {source_file}）\n{content}")
+            context = "\n\n---\n\n".join(context_parts)
         else:
-            context = "（没有找到相关文档内容）"
+            context = "（没有找到相关文档）"
         
-        # 3. 手动构建 prompt（避免占位符问题）
-        system_prompt = f"""你是一个专业的文档问答助手。你必须严格基于下面的【文档内容】来回答用户的问题。
+        # 3. 系统提示词：不拒绝任何问题，基于文档回答
+        system_prompt = f"""你是一个专业的文档问答助手。请基于下面的【文档内容】回答用户的问题。
 
 【文档内容】
 {context}
 
-重要规则：
-1. 如果文档中有相关信息，直接基于文档内容回答
-2. 如果文档中没有相关信息，直接说"根据现有文档，我没有找到相关信息"
-3. 不要编造任何内容
-4. 回答要简洁准确"""
+规则：
+1. 如果文档中有相关信息，直接回答，并在末尾标注【来源：文档X】（X是文档编号）
+2. 如果文档中没有相关信息，直接说"根据现有文档，我没有找到相关信息"，不要编造
+3. 回答要简洁准确
 
-        user_prompt = question
+请回答："""
+
+        response = client.chat.completions.create(
+            model="qwen-plus",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question}
+            ],
+            temperature=0.1
+        )
         
-        # 4. 调用大模型
-        response = llm.invoke([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ])
-        
-        return response.content
+        return response.choices[0].message.content
     
     return ask
+
+
+def extract_sources_from_answer(answer, retrieved_docs):
+    """从回答中提取来源编号，并返回对应的文档内容"""
+    # 匹配 【来源：X】 或 【来源：X,Y】 格式
+    pattern = r'【来源：([\d,]+)】'
+    match = re.search(pattern, answer)
+    
+    # 如果没有找到来源标注，返回原始回答和空列表
+    if not match:
+        # 清理可能的不完整标注
+        clean_answer = re.sub(r'\s*【来源：[\d,]*】?\s*', '', answer)
+        return clean_answer, []
+    
+    # 提取编号
+    source_indices = [int(idx.strip()) - 1 for idx in match.group(1).split(',')]
+    
+    # 根据编号获取对应的文档内容
+    sources = []
+    for idx in source_indices:
+        if 0 <= idx < len(retrieved_docs):
+            content = retrieved_docs[idx].page_content
+            # 截取前 200 字符作为预览
+            preview = content[:200] + "..." if len(content) > 200 else content
+            sources.append(preview)
+    
+    # 从回答中移除来源标注
+    clean_answer = re.sub(r'\s*【来源：[\d,]+】\s*', '', answer)
+    
+    return clean_answer, sources
