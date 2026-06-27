@@ -6,7 +6,7 @@
           {{ msg.role === 'user' ? '👤' : '🤖' }}
         </div>
         <div class="content">
-          <div class="text">{{ msg.content }}</div>
+          <div class="text text-left">{{ msg.content }}</div>
           <div v-if="msg.sources && msg.sources.length" class="sources">
             <details>
               <summary>📚 引用来源</summary>
@@ -103,7 +103,7 @@ watch(() => props.messages.length, async () => {
 }
 
 .message.user .avatar {
-  background: #667eea;
+  background: #edf3fe;
 }
 
 .message.assistant .avatar {
@@ -124,22 +124,24 @@ watch(() => props.messages.length, async () => {
 
 .content {
   max-width: 70%;
-  background: white;
+  background: #f2f2f2;
   padding: 12px 16px;
   border-radius: 12px;
   box-shadow: 0 1px 2px rgba(0,0,0,0.1);
 }
 
 .message.user .content {
-  background: #667eea;
-  color: white;
+  background: #edf3fe;
+  color: #0f1115;
 }
 
 .text {
   white-space: pre-wrap;
   word-break: break-word;
 }
-
+.text-left {
+  text-align: left;
+}
 .sources {
   margin-top: 8px;
   font-size: 12px;
@@ -194,12 +196,12 @@ watch(() => props.messages.length, async () => {
 }
 
 .input-area input:focus {
-  border-color: #667eea;
+  border-color: #edf3fe;
 }
 
 .input-area button {
   padding: 8px 24px;
-  background: #667eea;
+  background: #edf3fe;
   color: white;
   border: none;
   border-radius: 24px;

@@ -1,4 +1,4 @@
-"""文档加载模块 - 支持 PDF、TXT、DOC、DOCX 等格式"""
+"""文档加载模块 - 支持 PDF、TXT、DOC、DOCX、PPT、PPTX、Markdown 等格式"""
 import os
 from typing import List
 
@@ -6,6 +6,8 @@ from langchain_community.document_loaders import (
     PyPDFLoader,      # PDF 加载器
     TextLoader,       # TXT 加载器
     UnstructuredWordDocumentLoader,  # Word 加载器
+    UnstructuredPowerPointLoader,    # PowerPoint 加载器
+    UnstructuredMarkdownLoader,      # Markdown 加载器
 )
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
@@ -22,6 +24,10 @@ class DocumentLoader:
         '.txt': TextLoader,
         '.docx': UnstructuredWordDocumentLoader,
         '.doc': UnstructuredWordDocumentLoader,
+        '.pptx': UnstructuredPowerPointLoader,
+        '.ppt': UnstructuredPowerPointLoader,
+        '.md': UnstructuredMarkdownLoader,
+        '.markdown': UnstructuredMarkdownLoader,
     }
     
     def __init__(self, folder_path: str = "./docs"):
@@ -66,6 +72,16 @@ class DocumentLoader:
             elif ext in ['.docx', '.doc']:
                 loader = self.SUPPORTED_FORMATS[ext](file_path, mode="single")
                 print(f"📝 加载 Word: {filename}")
+                return loader.load()
+            
+            elif ext in ['.pptx', '.ppt']:
+                loader = self.SUPPORTED_FORMATS[ext](file_path, mode="single")
+                print(f"📊 加载 PowerPoint: {filename}")
+                return loader.load()
+            
+            elif ext in ['.md', '.markdown']:
+                loader = self.SUPPORTED_FORMATS[ext](file_path, mode="single")
+                print(f"📑 加载 Markdown: {filename}")
                 return loader.load()
                 
         except Exception as e:

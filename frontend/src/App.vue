@@ -92,26 +92,47 @@ const sendMessage = async (question) => {
   
   isThinking.value = true
   
+  // 添加 AI 回答占位
+  const aiMsgIndex = messages.value.push({
+    role: 'assistant',
+    content: '',
+    sources: [],
+    timestamp: new Date()
+  }) - 1
+  
   try {
-    const res = await axios.post(`${API_BASE}/chat`, {
-      question: question,
-      history: messages.value.filter(m => m.role !== 'system').slice(-5)
+    const response = await fetch(`${API_BASE}/chat/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        question: question,
+        history: messages.value.filter(m => m.role !== 'system').slice(-5)
+      })
     })
     
-    // 添加 AI 回答
-    messages.value.push({
-      role: 'assistant',
-      content: res.data.answer,
-      sources: res.data.sources,
-      timestamp: new Date()
-    })
+    if (!response.ok) {
+      throw new Error('网络请求失败')
+    }
+    
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    
+    while (true) {
+      const { done, value } = await reader.read()
+      
+      if (done) {
+        break
+      }
+      
+      const chunk = decoder.decode(value, { stream: true })
+      messages.value[aiMsgIndex].content += chunk
+    }
+    
   } catch (error) {
     console.error('问答失败', error)
-    messages.value.push({
-      role: 'assistant',
-      content: '抱歉，处理问题时出错了。请确保已上传文档。',
-      timestamp: new Date()
-    })
+    messages.value[aiMsgIndex].content = '抱歉，处理问题时出错了。请确保已上传文档。'
   } finally {
     isThinking.value = false
   }

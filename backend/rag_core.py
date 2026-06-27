@@ -1,12 +1,12 @@
-"""backend/rag_core.py - RAG 核心模块"""
+"""backend/rag_core.py - RAG 核心模块（向量化检索版）"""
 import os
 import re
+import time
 import numpy as np
 from dotenv import load_dotenv
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, UnstructuredWordDocumentLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+import faiss
 
 # 加载环境变量
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
@@ -18,28 +18,140 @@ DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
 if not DASHSCOPE_API_KEY:
     raise ValueError("请在项目根目录的 .env 文件中设置 DASHSCOPE_API_KEY")
 
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
-RETRIEVAL_TOP_K = 4
+# 文档分块配置 - 优化分块大小以适应中文语义
+CHUNK_SIZE = 500  # 增大块大小以包含更多上下文
+CHUNK_OVERLAP = 80  # 增加重叠以保持上下文连贯
+RETRIEVAL_TOP_K = 5  # 检索更多相关文档以提高覆盖率
+
+# ============================================
+# 向量化检索器类
+# ============================================
+class VectorRetriever:
+    """基于向量化检索的检索器"""
+
+    def __init__(self):
+        self.index = None
+        self.chunks = []
+        self.embedding_dim = 1536  # DashScope text-embedding-v2 维度
+        self.max_tokens = 1800  # 设置安全上限，留出余量
+
+    def truncate_text(self, text, max_length=1800):
+        """截断文本以符合 API 限制"""
+        if len(text) <= max_length:
+            return text
+        # 按字符截断
+        return text[:max_length]
+
+    def get_embedding(self, text):
+        """调用 DashScope API 获取文本向量"""
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=DASHSCOPE_API_KEY,
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+
+        # 截断文本以符合 API 限制
+        text = self.truncate_text(text, self.max_tokens)
+
+        try:
+            response = client.embeddings.create(
+                model="text-embedding-v2",
+                input=text
+            )
+            embedding = response.data[0].embedding
+            return np.array(embedding, dtype=np.float32)
+        except Exception as e:
+            print(f"❌ 获取向量失败: {e}")
+            return None
+
+    def build_index(self, chunks):
+        """构建 FAISS 索引"""
+        self.chunks = chunks
+
+        if not chunks:
+            self.index = None
+            print("⚠️ 没有文档块可索引")
+            return
+
+        print(f"🔄 正在生成 {len(chunks)} 个文档块的向量...")
+
+        # 逐个生成向量（更稳定）
+        embeddings = []
+        failed_count = 0
+
+        for i, chunk in enumerate(chunks):
+            embedding = self.get_embedding(chunk.page_content)
+            if embedding is not None:
+                embeddings.append(embedding)
+            else:
+                failed_count += 1
+                # 使用零向量作为占位
+                embeddings.append(np.zeros(self.embedding_dim, dtype=np.float32))
+
+            if (i + 1) % 10 == 0:
+                print(f"  已处理 {i + 1}/{len(chunks)} 个文档块...")
+
+        if failed_count > 0:
+            print(f"⚠️ 有 {failed_count} 个文档块生成向量失败")
+
+        if not embeddings:
+            print("❌ 无法生成任何向量")
+            return
+
+        # 构建 FAISS 索引
+        embeddings_matrix = np.array(embeddings)
+        self.index = faiss.IndexFlatL2(self.embedding_dim)
+        self.index.add(embeddings_matrix)
+
+        print(f"✅ 向量索引构建完成，共 {len(chunks)} 个文档块")
+
+    def retrieve(self, query, top_k=RETRIEVAL_TOP_K):
+        """检索最相关的文档块"""
+        if self.index is None or not self.chunks:
+            return []
+
+        # 获取查询向量
+        query_embedding = self.get_embedding(query)
+        if query_embedding is None:
+            return []
+
+        query_embedding = query_embedding.reshape(1, -1)
+
+        # 检索
+        n_results = min(top_k, len(self.chunks))
+        distances, indices = self.index.search(query_embedding, n_results)
+
+        results = []
+        for i, idx in enumerate(indices[0]):
+            if idx < len(self.chunks):
+                results.append(self.chunks[idx])
+
+        return results
+
 
 # ============================================
 # 文档加载
 # ============================================
 def load_documents_from_folder(folder_path=None):
-    """加载文件夹内的所有 PDF、TXT 和 Word 文件"""
+    """递归加载文件夹内的所有 PDF、TXT 和 Word 文件"""
     if folder_path is None:
         folder_path = os.path.join(os.path.dirname(__file__), "docs")
-    
+
     all_documents = []
-    
+
     if not os.path.exists(folder_path):
         os.makedirs(folder_path, exist_ok=True)
         print(f"📁 已创建 {folder_path} 文件夹，请放入你的文档")
         return []
-    
+
     for filename in os.listdir(folder_path):
         file_path = os.path.join(folder_path, filename)
-        
+
+        if os.path.isdir(file_path):
+            all_documents.extend(load_documents_from_folder(file_path))
+            continue
+
         if filename.endswith('.pdf'):
             try:
                 loader = PyPDFLoader(file_path)
@@ -47,7 +159,7 @@ def load_documents_from_folder(folder_path=None):
                 print(f"📄 加载 PDF: {filename}")
             except Exception as e:
                 print(f"❌ 加载 PDF 失败 {filename}: {e}")
-                
+
         elif filename.endswith('.txt'):
             try:
                 for encoding in ['utf-8', 'gbk', 'gb2312']:
@@ -60,7 +172,7 @@ def load_documents_from_folder(folder_path=None):
                         continue
             except Exception as e:
                 print(f"❌ 加载文本失败 {filename}: {e}")
-        
+
         elif filename.endswith('.docx') or filename.endswith('.doc'):
             try:
                 loader = UnstructuredWordDocumentLoader(file_path, mode="single")
@@ -68,22 +180,45 @@ def load_documents_from_folder(folder_path=None):
                 print(f"📝 加载 Word: {filename}")
             except Exception as e:
                 print(f"❌ 加载 Word 失败 {filename}: {e}")
-    
+
+        elif filename.endswith('.xlsx') or filename.endswith('.xls'):
+            try:
+                from langchain_community.document_loaders import UnstructuredExcelLoader
+                loader = UnstructuredExcelLoader(file_path, mode="elements")
+                all_documents.extend(loader.load())
+                print(f"📊 加载 Excel: {filename}")
+            except Exception as e:
+                print(f"❌ 加载 Excel 失败 {filename}: {e}")
+
     return all_documents
 
 
 def split_documents(documents):
-    """将文档切分成小块"""
+    """将文档切分成小块 - 优化中文分块策略"""
     if not documents:
         return []
-    
+
+    # 优化分块策略：更好地保持语义完整性
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""]
+        # 中文分块优先按段落、句子切分
+        separators=[
+            "\n\n",  # 段落分隔
+            "\n",    # 换行分隔
+            "。", "！", "？", "；",  # 句子分隔
+            "，", "、",  # 短句分隔
+            " ", ""
+        ],
+        length_function=len
     )
+
     chunks = splitter.split_documents(documents)
-    print(f"✂️ 切分成 {len(chunks)} 个文本块")
+
+    # 过滤过短的块
+    chunks = [chunk for chunk in chunks if len(chunk.page_content) >= 50]
+
+    print(f"✂️ 切分成 {len(chunks)} 个文本块（过滤了过短块后）")
     return chunks
 
 
@@ -157,16 +292,19 @@ def create_rag_chain(retriever):
         else:
             context = "（没有找到相关文档）"
         
-        # 3. 系统提示词：不拒绝任何问题，基于文档回答
-        system_prompt = f"""你是一个专业的文档问答助手。请基于下面的【文档内容】回答用户的问题。
+        # 3. 系统提示词：充分利用检索到的文档内容
+        system_prompt = f"""你是一个专业的文档问答助手。你已经通过检索系统找到了与用户问题相关的文档片段。请仔细阅读这些文档内容，并基于它们回答问题。
 
-【文档内容】
+【检索到的相关文档内容】
 {context}
 
-规则：
-1. 如果文档中有相关信息，直接回答，并在末尾标注【来源：文档X】（X是文档编号）
-2. 如果文档中没有相关信息，直接说"根据现有文档，我没有找到相关信息"，不要编造
-3. 回答要简洁准确
+【回答要求】
+1. 必须基于上述文档内容回答，不要说"根据现有文档，我没有找到相关信息"，除非文档内容完全不相关
+2. 如果文档中有部分相关信息，在末尾标注【来源：文档X】
+3. 如果文档内容与问题相关，直接引用文档内容进行回答 
+4. 回答要准确，不要编造文档中没有的信息
+
+用户问题：{question}
 
 请回答："""
 
@@ -182,6 +320,66 @@ def create_rag_chain(retriever):
         return response.choices[0].message.content
     
     return ask
+
+
+def create_streaming_rag_chain(retriever):
+    """创建流式 RAG 问答函数"""
+    from openai import OpenAI
+    
+    client = OpenAI(
+        api_key=DASHSCOPE_API_KEY,
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
+    
+    def ask_streaming(question):
+        # 1. 检索相关文档
+        docs = retriever.retrieve(question)
+        
+        # 2. 构建带编号的上下文
+        if docs:
+            context_parts = []
+            for i, doc in enumerate(docs):
+                source_file = os.path.basename(doc.metadata.get('source', 'unknown'))
+                content = doc.page_content
+                context_parts.append(f"【文档{i+1}】（来自 {source_file}）\n{content}")
+            context = "\n\n---\n\n".join(context_parts)
+        else:
+            context = "（没有找到相关文档）"
+        
+        # 3. 系统提示词：充分利用检索到的文档内容
+        system_prompt = f"""你是一个专业的文档问答助手。你已经通过检索系统找到了与用户问题相关的文档片段。请仔细阅读这些文档内容，并基于它们回答问题。
+
+【检索到的相关文档内容】
+{context}
+
+【回答要求】
+1. 必须基于上述文档内容回答，不要说"根据现有文档，我没有找到相关信息"，除非文档内容完全不相关
+2. 如果文档中有部分相关信息， 在末尾标注【来源：文档X】
+3. 如果文档内容与问题相关，直接引用文档内容进行回答
+4. 回答要准确，不要编造文档中没有的信息
+
+用户问题：{question}
+
+请回答："""
+
+        # 4. 流式生成回答
+        stream = client.chat.completions.create(
+            model="qwen-plus",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question}
+            ],
+            temperature=0.1,
+            stream=True
+        )
+        
+        # 5. 逐块返回
+        for chunk in stream:
+            content = chunk.choices[0].delta.content
+            if content:
+                yield content
+    
+    return ask_streaming
 
 
 def extract_sources_from_answer(answer, retrieved_docs):
